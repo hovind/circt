@@ -96,6 +96,8 @@ struct Context {
   FunctionLowering *
   declareFunction(const slang::ast::SubroutineSymbol &subroutine);
   LogicalResult convertFunction(const slang::ast::SubroutineSymbol &subroutine);
+  LogicalResult
+  convertPrimitive(const slang::ast::PrimitiveInstanceSymbol &primitive);
 
   // Convert a statement AST node to MLIR ops.
   LogicalResult convertStatement(const slang::ast::Statement &stmt);
@@ -108,6 +110,22 @@ struct Context {
   // Convert a slang timing control into an MLIR timing control.
   LogicalResult convertTimingControl(const slang::ast::TimingControl &ctrl,
                                      const slang::ast::Statement &stmt);
+
+  /// Helper functions.
+  template <typename OpTy>
+  Value convertNInputPrimitiveOp(Location loc, bool negate,
+                                 MutableArrayRef<BlockArgument> inputs);
+
+  FailureOr<SmallVector<hw::ModulePort>>
+  primitivePorts(const slang::ast::PrimitiveInstanceSymbol &symbol);
+  FailureOr<moore::SVModuleOp>
+  declarePrimitive(const slang::ast::PrimitiveSymbol &primitiveType,
+                   ArrayRef<hw::ModulePort> modulePorts);
+  FailureOr<Value> convert1InputPrimitive(Location loc, std::string_view name,
+                                          Value input);
+  FailureOr<Value>
+  convertNInputPrimitive(Location loc, std::string_view name,
+                         MutableArrayRef<BlockArgument> inputs);
 
   /// Helper function to convert a value to its "truthy" boolean value.
   Value convertToBool(Value value);
@@ -156,6 +174,9 @@ struct Context {
   /// The top-level operations ordered by their Slang source location. This is
   /// used to produce IR that follows the source file order.
   std::map<slang::SourceLocation, Operation *> orderedRootOps;
+
+  std::map<std::tuple<std::string_view, unsigned, unsigned>, moore::SVModuleOp>
+      primitives;
 
   /// How we have lowered modules to MLIR.
   DenseMap<const slang::ast::InstanceBodySymbol *,

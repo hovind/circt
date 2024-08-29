@@ -8,6 +8,7 @@
 
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
+#include "llvm/ADT/StringSwitch.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -543,6 +544,16 @@ struct ModuleVisitor : public BaseVisitor {
     return context.convertFunction(subroutine);
   }
 
+  // Handle primitive instances.
+  LogicalResult visit(const slang::ast::PrimitiveInstanceSymbol &primitive) {
+    return context.convertPrimitive(primitive);
+  }
+
+  LogicalResult visit(const slang::ast::SpecifyBlockSymbol &specify) {
+    // Skip
+    return success();
+  }
+
   /// Emit an error for all other members.
   template <typename T>
   LogicalResult visit(T &&node) {
@@ -934,5 +945,226 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   }
   if (returnVar && returnVar.use_empty())
     returnVar.getDefiningOp()->erase();
+  return success();
+}
+
+template <typename OpTy>
+Value Context::convertNInputPrimitiveOp(Location loc, bool negate,
+                                        MutableArrayRef<BlockArgument> inputs) {
+  SmallVector<Value> ops(inputs.begin(), inputs.end());
+  while (ops.size() > 1) {
+    SmallVector<Value> worklist(ops.begin(), ops.end());
+    ops.clear();
+    while (worklist.size() >= 2) {
+      auto lhs = worklist.pop_back_val();
+      auto rhs = worklist.pop_back_val();
+      auto op = builder.create<OpTy>(loc, lhs, rhs);
+      ops.push_back(op);
+    }
+    /* TODO: balance binary tree */
+    if (!worklist.empty()) {
+      ops.push_back(worklist.pop_back_val());
+    }
+  }
+
+  return negate ? builder.create<moore::NotOp>(loc, ops.front()) : ops.front();
+}
+
+FailureOr<Value> Context::convert1InputPrimitive(Location loc,
+                                                 std::string_view name,
+                                                 Value input) {
+  auto op = llvm::StringSwitch<Value>(name)
+                .Case("not", builder.create<moore::NotOp>(loc, input))
+                .Case("buf", input)
+                .Default({});
+  if (!op) {
+    mlir::emitError(loc, "unsupported 1-input primitive: ") << name;
+
+    return failure();
+  }
+  return op;
+}
+
+FailureOr<Value>
+Context::convertNInputPrimitive(Location loc, std::string_view name,
+                                MutableArrayRef<BlockArgument> inputs) {
+  auto op =
+      llvm::StringSwitch<Value>(name)
+          .Case("and",
+                convertNInputPrimitiveOp<moore::AndOp>(loc, false, inputs))
+          .Case("or", convertNInputPrimitiveOp<moore::OrOp>(loc, false, inputs))
+          .Case("xor",
+                convertNInputPrimitiveOp<moore::XorOp>(loc, false, inputs))
+          .Case("nand",
+                convertNInputPrimitiveOp<moore::AndOp>(loc, true, inputs))
+          .Case("xnor",
+                convertNInputPrimitiveOp<moore::XorOp>(loc, true, inputs))
+          .Default({});
+  if (!op) {
+    mlir::emitError(loc, "unsupported n-input primitive: ") << name;
+
+    return failure();
+  }
+  return op;
+}
+
+std::string namePrimitive(std::string_view name,
+                          const slang::ast::PrimitiveSymbol::PrimitiveKind kind,
+                          unsigned inputs, unsigned outputs) {
+  using slang::ast::PrimitiveSymbol;
+
+  std::string builder = std::string(name);
+  if (kind == PrimitiveSymbol::NInput)
+    builder += llvm::utostr(inputs);
+  else if (kind == PrimitiveSymbol::NOutput)
+    builder += llvm::utostr(outputs);
+
+  return builder;
+}
+
+FailureOr<moore::SVModuleOp>
+Context::declarePrimitive(const slang::ast::PrimitiveSymbol &primitive,
+                          ArrayRef<hw::ModulePort> modulePorts) {
+  using slang::ast::PrimitivePortDirection;
+  using slang::ast::PrimitiveSymbol;
+
+  auto moduleType = hw::ModuleType::get(getContext(), modulePorts);
+
+  auto &module = primitives[std::make_tuple(
+      primitive.name, moduleType.getNumInputs(), moduleType.getNumOutputs())];
+  if (module)
+    return module;
+
+  OpBuilder::InsertionGuard g(builder);
+
+  const auto loc = convertLocation(primitive.location);
+  auto block = std::make_unique<Block>();
+  for (const auto port : moduleType.getPorts()) {
+    if (port.dir != hw::ModulePort::Input)
+      continue;
+
+    /* TODO: Use proper port location */
+    block->addArgument(port.type, loc);
+  }
+
+  auto it = orderedRootOps.upper_bound(primitive.location);
+  if (it == orderedRootOps.end())
+    builder.setInsertionPointToEnd(intoModuleOp.getBody());
+  else
+    builder.setInsertionPoint(it->second);
+
+  const auto name =
+      namePrimitive(primitive.name, primitive.primitiveKind,
+                    moduleType.getNumInputs(), moduleType.getNumOutputs());
+
+  module = builder.create<moore::SVModuleOp>(loc, name, moduleType);
+  module.getBodyRegion().push_back(block.release());
+
+  symbolTable.insert(module);
+
+  builder.setInsertionPointToEnd(module.getBody());
+
+  const auto inputs = module.getBody()->getArguments();
+  auto op = inputs.size() == 1
+                ? convert1InputPrimitive(loc, primitive.name, inputs.front())
+                : convertNInputPrimitive(loc, primitive.name, inputs);
+
+  if (failed(op))
+    return failure();
+
+  SmallVector<Value> outputs(moduleType.getNumOutputs(), op.value());
+  builder.create<moore::OutputOp>(op.value().getLoc(), outputs);
+  return module;
+}
+
+FailureOr<SmallVector<hw::ModulePort>>
+Context::primitivePorts(const slang::ast::PrimitiveInstanceSymbol &symbol) {
+  using slang::ast::PrimitivePortDirection;
+  using slang::ast::PrimitiveSymbol;
+
+  const auto size = symbol.getPortConnections().size();
+
+  SmallVector<hw::ModulePort> modulePorts;
+  for (const auto *const port : symbol.primitiveType.ports) {
+    auto type = convertType(port->getType());
+    if (!type)
+      return failure();
+
+    auto portName = builder.getStringAttr(port->name);
+    if (port->direction == PrimitivePortDirection::Out) {
+      const auto arity =
+          symbol.primitiveType.primitiveKind == PrimitiveSymbol::NOutput
+              ? size - 1
+              : 1U;
+      modulePorts.append(arity, {portName, type, hw::ModulePort::Output});
+    } else if (port->direction == PrimitivePortDirection::In) {
+      const auto arity =
+          symbol.primitiveType.primitiveKind == PrimitiveSymbol::NInput
+              ? size - 1
+              : 1U;
+      modulePorts.append(arity, {portName, type, hw::ModulePort::Input});
+    } else {
+      return failure();
+    }
+  }
+  return modulePorts;
+}
+
+/// Convert a primitive instance.
+LogicalResult Context::convertPrimitive(
+    const slang::ast::PrimitiveInstanceSymbol &primitive) {
+  using slang::ast::AssignmentExpression;
+  using slang::ast::Expression;
+
+  const auto modulePorts = primitivePorts(primitive);
+
+  const auto lowering =
+      declarePrimitive(primitive.primitiveType, modulePorts.value());
+  if (failed(lowering)) {
+    return lowering;
+  }
+
+  auto module = lowering.value();
+  auto moduleType = module.getModuleType();
+
+  SymbolTable::setSymbolVisibility(module, SymbolTable::Visibility::Private);
+
+  const auto inputNames = builder.getArrayAttr(moduleType.getInputNames());
+  const auto outputNames = builder.getArrayAttr(moduleType.getOutputNames());
+  const auto loc = convertLocation(primitive.location);
+
+  // Match the module's ports up with the port values determined above.
+  SmallVector<Value> inputValues;
+  SmallVector<Value> outputValues;
+  inputValues.reserve(moduleType.getNumInputs());
+  outputValues.reserve(moduleType.getNumOutputs());
+
+  for (auto [port, conn] :
+       llvm::zip(moduleType.getPorts(), primitive.getPortConnections())) {
+    if (port.dir == hw::ModulePort::Output) {
+      const auto *expr = conn;
+      if (const auto *assign = expr->as_if<AssignmentExpression>())
+        expr = &assign->left();
+
+      const auto value = convertLvalueExpression(*expr);
+      outputValues.push_back(value);
+    } else if (port.dir == hw::ModulePort::Input) {
+      const auto value = convertRvalueExpression(*conn);
+      inputValues.push_back(value);
+    } else {
+      return failure();
+    }
+  }
+
+  auto inst = builder.create<moore::InstanceOp>(
+      loc, moduleType.getOutputTypes(), builder.getStringAttr(""),
+      FlatSymbolRefAttr::get(module.getSymNameAttr()), inputValues, inputNames,
+      outputNames);
+
+  // Assign output values from the instance to the connected expression.
+  for (auto [lvalue, output] : llvm::zip(outputValues, inst.getOutputs()))
+    if (lvalue)
+      builder.create<moore::ContinuousAssignOp>(loc, lvalue, output);
+
   return success();
 }
