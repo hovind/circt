@@ -8,6 +8,7 @@
 
 #include "ImportVerilogInternals.h"
 #include "slang/ast/Compilation.h"
+#include "llvm/ADT/StringSwitch.h"
 
 using namespace circt;
 using namespace ImportVerilog;
@@ -524,6 +525,16 @@ struct ModuleVisitor : public BaseVisitor {
     return context.convertFunction(subroutine);
   }
 
+  // Handle primitive instances.
+  LogicalResult visit(const slang::ast::PrimitiveInstanceSymbol &primitive) {
+    return context.convertPrimitive(primitive);
+  }
+
+  LogicalResult visit(const slang::ast::SpecifyBlockSymbol &specify) {
+    // Skip
+    return success();
+  }
+
   /// Emit an error for all other members.
   template <typename T>
   LogicalResult visit(T &&node) {
@@ -926,5 +937,113 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   }
   if (returnVar && returnVar.use_empty())
     returnVar.getDefiningOp()->erase();
+  return success();
+}
+
+static std::tuple<nonstd::span<const slang::ast::Expression *const>,
+                  nonstd::span<const slang::ast::Expression *const>>
+partitionPortConnections(const slang::ast::PrimitiveInstanceSymbol &primitive) {
+  const auto connections = primitive.getPortConnections();
+  const auto numOutputs = primitive.primitiveType.primitiveKind ==
+                                  slang::ast::PrimitiveSymbol::NOutput
+                              ? connections.size() - 1
+                              : 1;
+  return std::tuple(connections.first(numOutputs),
+                    connections.last(connections.size() - numOutputs));
+}
+
+template <typename OpTy>
+Value Context::convertNInputPrimitiveOp(Location loc, bool negate,
+                                        SmallVector<Value> &inputs) {
+  SmallVector<Value> ops(inputs.begin(), inputs.end());
+  while (ops.size() > 1) {
+    SmallVector<Value> worklist(ops.begin(), ops.end());
+    ops.clear();
+    while (worklist.size() >= 2) {
+      auto lhs = worklist.pop_back_val();
+      auto rhs = worklist.pop_back_val();
+      auto op = builder.create<OpTy>(loc, lhs, rhs);
+      ops.push_back(op);
+    }
+    /* TODO: balance binary tree */
+    if (!worklist.empty()) {
+      ops.push_back(worklist.pop_back_val());
+    }
+  }
+
+  return negate ? builder.create<moore::NotOp>(loc, ops.front()) : ops.front();
+}
+
+FailureOr<Value> Context::convert1InputPrimitive(Location loc,
+                                                 std::string_view name,
+                                                 Value input) {
+  auto op = llvm::StringSwitch<Value>(name)
+                .Case("not", builder.create<moore::NotOp>(loc, input))
+                .Case("buf", input)
+                .Default({});
+  if (!op) {
+    mlir::emitError(loc, "unsupported 1-input primitive: ") << name;
+
+    return failure();
+  }
+  return op;
+}
+
+FailureOr<Value> Context::convertNInputPrimitive(Location loc,
+                                                 std::string_view name,
+                                                 SmallVector<Value> &inputs) {
+  auto op =
+      llvm::StringSwitch<Value>(name)
+          .Case("and",
+                convertNInputPrimitiveOp<moore::AndOp>(loc, false, inputs))
+          .Case("or", convertNInputPrimitiveOp<moore::OrOp>(loc, false, inputs))
+          .Case("xor",
+                convertNInputPrimitiveOp<moore::XorOp>(loc, false, inputs))
+          .Case("nand",
+                convertNInputPrimitiveOp<moore::AndOp>(loc, true, inputs))
+          .Case("nor", convertNInputPrimitiveOp<moore::OrOp>(loc, true, inputs))
+          .Case("xnor",
+                convertNInputPrimitiveOp<moore::XorOp>(loc, true, inputs))
+          .Default({});
+  if (!op) {
+    mlir::emitError(loc, "unsupported n-input primitive: ") << name;
+
+    return failure();
+  }
+  return op;
+}
+
+/// Convert a primitive instance.
+LogicalResult Context::convertPrimitive(
+    const slang::ast::PrimitiveInstanceSymbol &primitive) {
+  using slang::ast::AssignmentExpression;
+  using slang::ast::Expression;
+
+  const auto loc = convertLocation(primitive.location);
+  const auto [outputExprs, inputExprs] = partitionPortConnections(primitive);
+
+  llvm::SmallVector<Value> inputs;
+  llvm::transform(
+      inputExprs, std::back_inserter(inputs),
+      [&](const Expression *const v) { return convertRvalueExpression(*v); });
+
+  auto op =
+      inputs.size() == 1
+          ? convert1InputPrimitive(loc, primitive.primitiveType.name,
+                                   inputs.front())
+          : convertNInputPrimitive(loc, primitive.primitiveType.name, inputs);
+
+  if (failed(op))
+    return op;
+
+  for (const auto *expr : outputExprs) {
+    // Unpack the `<expr> = EmptyArgument` pattern emitted by Slang for output
+    // and inout arguments.
+    if (const auto *assign = expr->as_if<AssignmentExpression>())
+      expr = &assign->left();
+
+    auto lhs = convertLvalueExpression(*expr);
+    builder.create<moore::ContinuousAssignOp>(loc, lhs, op.value());
+  }
   return success();
 }
