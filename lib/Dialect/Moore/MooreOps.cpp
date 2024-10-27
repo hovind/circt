@@ -10,14 +10,17 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Dialect/HW/CustomDirectiveImpl.h"
 #include "circt/Dialect/HW/ModuleImplementation.h"
 #include "circt/Dialect/Moore/MooreAttributes.h"
+#include "circt/Dialect/Moore/MooreOps.h"
 #include "circt/Support/CustomDirectiveImpl.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Debug.h"
+
+#define DEBUG_TYPE "moore-ops"
 
 using namespace circt;
 using namespace circt::moore;
@@ -428,41 +431,81 @@ LogicalResult NetOp::canonicalize(NetOp op, PatternRewriter &rewriter) {
 
   // Check if the net has one unique continuous assignment to it, and
   // additionally if all other users are reads.
-  auto *block = op->getBlock();
-  ContinuousAssignOp uniqueAssignOp;
-  bool allUsesAreReads = true;
+  ContinuousAssignOp assignOp;
+  SmallVector<ReadOp> reads;
+  DenseMap<unsigned, ExtractRefOp> extracts;
   for (auto *user : op->getUsers()) {
     // Ensure that all users of the net are in the same block.
-    if (user->getBlock() != block)
+    if (user->getBlock() != op->getBlock()) {
+      LLVM_DEBUG({
+        llvm::dbgs() << "Canonicalization failed: user in other block\n";
+      });
       return failure();
+    }
 
     // Ensure there is at most one unique continuous assignment to the net.
-    if (auto assignOp = dyn_cast<ContinuousAssignOp>(user)) {
-      if (uniqueAssignOp)
+    if (auto assignmentOp = dyn_cast<ContinuousAssignOp>(user)) {
+      if (assignOp) {
+        LLVM_DEBUG({
+          llvm::dbgs() << "Canonicalization failed: multiple assignments\n";
+        });
+
         return failure();
-      uniqueAssignOp = assignOp;
+      }
+      assignOp = assignmentOp;
       continue;
     }
 
-    // Ensure all other users are reads.
-    if (!isa<ReadOp>(user))
-      allUsesAreReads = false;
+    if (auto readOp = dyn_cast<ReadOp>(user)) {
+      reads.push_back(readOp);
+      continue;
+    }
+
+    if (auto extractOp = dyn_cast<ExtractRefOp>(user)) {
+      extracts.try_emplace(extractOp.getLowBit(), extractOp);
+      continue;
+    }
+
+    LLVM_DEBUG({
+      llvm::dbgs() << "Canonicalization failed: user that is not an "
+                      "assignment, a read nor an extraction: "
+                   << *user << "\n";
+    });
+    return failure();
   }
 
-  // If there was one unique assignment, and the `NetOp` does not yet have an
-  // assigned value set, fold the assignment into the net.
-  if (uniqueAssignOp && !op.getAssignment()) {
+  // If there was one unique assignment, and the `NetOp` does not yet have
+  // an assigned value set, fold the assignment into the net.
+  if (assignOp && !op.getAssignment()) {
     rewriter.modifyOpInPlace(
-        op, [&] { op.getAssignmentMutable().assign(uniqueAssignOp.getSrc()); });
-    rewriter.eraseOp(uniqueAssignOp);
+        op, [&] { op.getAssignmentMutable().assign(assignOp.getSrc()); });
+    rewriter.eraseOp(assignOp);
+    assignOp = {};
     modified = true;
-    uniqueAssignOp = {};
+  }
+
+  if (extracts.size() > 1 && !op.getAssignment()) {
+    SmallVector<Value> parts;
+    for (auto [lowBit, extractOp] : extracts) {
+      auto subNetOp = rewriter.create<NetOp>(
+          extractOp.getLoc(), extractOp.getResult().getType(),
+          /*name*/ StringAttr{}, op.getKind(),
+          /*assignment*/ Value{});
+      rewriter.replaceOp(extractOp, subNetOp);
+      parts.push_back(rewriter.create<ReadOp>(extractOp.getLoc(), subNetOp));
+    }
+
+    std::reverse(parts.begin(), parts.end());
+    auto concat = rewriter.create<moore::ConcatOp>(op->getLoc(), parts);
+    rewriter.modifyOpInPlace(op,
+                             [&] { op.getAssignmentMutable().assign(concat); });
+    modified = true;
   }
 
   // If all users of the net op are reads, and any potential unique assignment
   // has been folded into the net op itself, directly replace the reads with the
   // net's assigned value.
-  if (!uniqueAssignOp && allUsesAreReads && op.getAssignment()) {
+  if (op.getAssignment()) {
     // If the original net had a name, create an `AssignedVariableOp` as a
     // replacement. Otherwise substitute the assigned value directly.
     auto assignedValue = op.getAssignment();
@@ -472,8 +515,7 @@ LogicalResult NetOp::canonicalize(NetOp op, PatternRewriter &rewriter) {
 
     // Replace all reads with the new assigned var op and remove the original
     // net op.
-    for (auto *user : llvm::make_early_inc_range(op->getUsers())) {
-      auto readOp = cast<ReadOp>(user);
+    for (auto readOp : reads) {
       rewriter.replaceOp(readOp, assignedValue);
     }
     rewriter.eraseOp(op);
