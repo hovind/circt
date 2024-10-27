@@ -948,28 +948,6 @@ Context::convertFunction(const slang::ast::SubroutineSymbol &subroutine) {
   return success();
 }
 
-template <typename OpTy>
-Value Context::convertNInputPrimitiveOp(Location loc, bool negate,
-                                        MutableArrayRef<BlockArgument> inputs) {
-  SmallVector<Value> ops(inputs.begin(), inputs.end());
-  while (ops.size() > 1) {
-    SmallVector<Value> worklist(ops.begin(), ops.end());
-    ops.clear();
-    while (worklist.size() >= 2) {
-      auto lhs = worklist.pop_back_val();
-      auto rhs = worklist.pop_back_val();
-      auto op = builder.create<OpTy>(loc, lhs, rhs);
-      ops.push_back(op);
-    }
-    /* TODO: balance binary tree */
-    if (!worklist.empty()) {
-      ops.push_back(worklist.pop_back_val());
-    }
-  }
-
-  return negate ? builder.create<moore::NotOp>(loc, ops.front()) : ops.front();
-}
-
 FailureOr<Value> Context::convert1InputPrimitive(Location loc,
                                                  std::string_view name,
                                                  Value input) {
@@ -988,24 +966,29 @@ FailureOr<Value> Context::convert1InputPrimitive(Location loc,
 FailureOr<Value>
 Context::convertNInputPrimitive(Location loc, std::string_view name,
                                 MutableArrayRef<BlockArgument> inputs) {
-  auto op =
-      llvm::StringSwitch<Value>(name)
-          .Case("and",
-                convertNInputPrimitiveOp<moore::AndOp>(loc, false, inputs))
-          .Case("or", convertNInputPrimitiveOp<moore::OrOp>(loc, false, inputs))
-          .Case("xor",
-                convertNInputPrimitiveOp<moore::XorOp>(loc, false, inputs))
-          .Case("nand",
-                convertNInputPrimitiveOp<moore::AndOp>(loc, true, inputs))
-          .Case("xnor",
-                convertNInputPrimitiveOp<moore::XorOp>(loc, true, inputs))
+  auto [negate, op] =
+      llvm::StringSwitch<std::tuple<bool, Value>>(name)
+          .Case("and", std::make_tuple(
+                           false, builder.create<moore::AndOp>(loc, inputs)))
+          .Case("or", std::make_tuple(false,
+                                      builder.create<moore::OrOp>(loc, inputs)))
+          .Case("xor", std::make_tuple(
+                           false, builder.create<moore::XorOp>(loc, inputs)))
+          .Case("nand", std::make_tuple(
+                            true, builder.create<moore::AndOp>(loc, inputs)))
+          .Case("nor",
+                std::make_tuple(true, builder.create<moore::OrOp>(loc, inputs)))
+          .Case("xnor", std::make_tuple(
+                            true, builder.create<moore::XorOp>(loc, inputs)))
           .Default({});
+
   if (!op) {
     mlir::emitError(loc, "unsupported n-input primitive: ") << name;
 
     return failure();
   }
-  return op;
+
+  return negate ? builder.create<moore::NotOp>(loc, op) : op;
 }
 
 std::string namePrimitive(std::string_view name,
