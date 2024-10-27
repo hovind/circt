@@ -621,13 +621,29 @@ def BoolCastOp : MooreOp<"bool_cast", [
   let hasFolder = 1;
 }
 
-class BinaryOpBase<string mnemonic, list<Trait> traits = []> :
+class NaryOpBase<string mnemonic, list<Trait> traits = []> :
     MooreOp<mnemonic, traits # [Pure, SameOperandsAndResultType]> {
-  let arguments = (ins SimpleBitVectorType:$lhs, SimpleBitVectorType:$rhs);
   let results = (outs SimpleBitVectorType:$result);
+}
+
+class BinaryOpBase<string mnemonic, list<Trait> traits = []> :
+    NaryOpBase<mnemonic, traits # [Pure, SameOperandsAndResultType]> {
+  let arguments = (ins SimpleBitVectorType:$lhs, SimpleBitVectorType:$rhs);
   let assemblyFormat = [{
     $lhs `,` $rhs attr-dict `:` type($result)
   }];
+}
+
+class VariadicOpBase<string mnemonic, list<Trait> traits = []> :
+    NaryOpBase<mnemonic, traits # [Pure, SameOperandsAndResultType]> {
+  let arguments = (ins Variadic<SimpleBitVectorType>:$inputs);
+  let assemblyFormat = [{
+    $inputs attr-dict `:` type($result)
+  }];
+
+  let builders = [OpBuilder<(ins "Value":$lhs, "Value":$rhs), [{
+    return build($_builder, $_state, ValueRange{lhs, rhs});
+  }]>];
 }
 
 def AddOp : BinaryOpBase<"add", [Commutative]> {
@@ -724,7 +740,7 @@ class PowOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
 def PowUOp : PowOpBase<"powu">;
 def PowSOp : PowOpBase<"pows">;
 
-def AndOp : BinaryOpBase<"and", [Commutative]> {
+def AndOp : VariadicOpBase<"and", [Commutative]> {
   let summary = "Bitwise AND operation";
   let description = [{
     Applies the boolean AND operation to each pair of corresponding bits in the
@@ -741,7 +757,7 @@ def AndOp : BinaryOpBase<"and", [Commutative]> {
   }];
 }
 
-def OrOp : BinaryOpBase<"or", [Commutative]> {
+def OrOp : VariadicOpBase<"or", [Commutative]> {
   let summary = "Bitwise OR operation";
   let description = [{
     Applies the boolean OR operation to each pair of corresponding bits in the
@@ -758,7 +774,7 @@ def OrOp : BinaryOpBase<"or", [Commutative]> {
   }];
 }
 
-def XorOp : BinaryOpBase<"xor", [Commutative]> {
+def XorOp : VariadicOpBase<"xor", [Commutative]> {
   let summary = "Bitwise XOR operation";
   let description = [{
     Applies the boolean XOR operation to each pair of corresponding bits in the

@@ -877,6 +877,19 @@ struct BinaryOpConversion : public OpConversionPattern<SourceOp> {
   }
 };
 
+template <typename SourceOp, typename TargetOp>
+struct VariadicOpConversion : public OpConversionPattern<SourceOp> {
+  using OpConversionPattern<SourceOp>::OpConversionPattern;
+  using OpAdaptor = typename SourceOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(SourceOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    rewriter.replaceOpWithNewOp<TargetOp>(op, adaptor.getInputs(), false);
+    return success();
+  }
+};
+
 template <typename SourceOp, ICmpPredicate pred>
 struct ICmpOpConversion : public OpConversionPattern<SourceOp> {
   using OpConversionPattern<SourceOp>::OpConversionPattern;
@@ -1491,9 +1504,11 @@ static void populateOpConversion(RewritePatternSet &patterns,
     BinaryOpConversion<DivSOp, comb::DivSOp>,
     BinaryOpConversion<ModUOp, comb::ModUOp>,
     BinaryOpConversion<ModSOp, comb::ModSOp>,
-    BinaryOpConversion<AndOp, comb::AndOp>,
-    BinaryOpConversion<OrOp, comb::OrOp>,
-    BinaryOpConversion<XorOp, comb::XorOp>,
+
+    // Patterns of variadic operations
+    VariadicOpConversion<AndOp, comb::AndOp>,
+    VariadicOpConversion<OrOp, comb::OrOp>,
+    VariadicOpConversion<XorOp, comb::XorOp>,
 
     // Patterns of relational operations.
     ICmpOpConversion<UltOp, ICmpPredicate::ult>,
