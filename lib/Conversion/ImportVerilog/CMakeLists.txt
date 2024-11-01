@@ -16,9 +16,7 @@ else ()
   # slang has some classes with virtual funcs but non-virtual destructor.
   add_compile_options(-Wno-non-virtual-dtor)
   # some other warnings we've seen
-  add_compile_options(-Wno-c++98-compat-extra-semi)
   add_compile_options(-Wno-ctad-maybe-unsupported)
-  add_compile_options(-Wno-cast-qual)
   # visitor switch statements cover all cases but have default
   add_compile_options(-Wno-covered-switch-default)
 endif ()
