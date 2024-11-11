@@ -1,5 +1,3 @@
-# slang uses exceptions
-
 # For ABI compatibility, define the DEBUG macro in debug builds. Slang sets this
 # internally. If we don't set this here as well, header-defined things like the
 # destructor of `Driver`, which is generated in ImportVerilog's compilation
