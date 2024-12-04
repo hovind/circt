@@ -554,6 +554,11 @@ llvm_canonicalize_cmake_booleans(CIRCT_SLANG_BUILD_FROM_SOURCE)
 if(CIRCT_SLANG_FRONTEND_ENABLED)
   message(STATUS "slang Verilog frontend is enabled")
   if(CIRCT_SLANG_BUILD_FROM_SOURCE)
+    check_compiler_version("GNU" "GCC" 10.1.0 10.1.0)
+    check_compiler_version("Clang" "Clang" 14.0.0 14.0.0)
+    check_compiler_version("AppleClang" "Apple Clang" 16.0 16.0)
+    check_compiler_version("MSVC" "Visual Studio" 19.00 19.00)
+
     # slang requires C++20
     set(CMAKE_CXX_STANDARD 20)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
